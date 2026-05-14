@@ -217,9 +217,18 @@ const transports = {};
 
 app.get('/sse', async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
+  const sessionServer = new Server(
+    { name: 'ghl-mcp-server', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
+  sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+  sessionServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const result = await handleTool(request.params.name, request.params.arguments || {});
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  });
   transports[transport.sessionId] = transport;
   res.on('close', () => delete transports[transport.sessionId]);
-  await server.connect(transport);
+  await sessionServer.connect(transport);
 });
 
 app.post('/messages', async (req, res) => {
