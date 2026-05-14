@@ -1,6 +1,9 @@
 import express from 'express';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 dotenv.config();
 
@@ -18,7 +21,6 @@ const GHL = axios.create({
 
 const LOCATION_ID = process.env.GHL_LOCATION_ID;
 
-// ── TOOLS DEFINITION ──────────────────────────────────────────
 const tools = [
   {
     name: 'search_contacts',
@@ -65,8 +67,8 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        startTime: { type: 'string', description: 'ISO 8601 start date e.g. 2026-05-01T00:00:00Z' },
-        endTime: { type: 'string', description: 'ISO 8601 end date e.g. 2026-05-31T23:59:59Z' },
+        startTime: { type: 'string', description: 'ISO 8601 start date' },
+        endTime: { type: 'string', description: 'ISO 8601 end date' },
         calendarId: { type: 'string', description: 'Optional calendar ID' },
       },
       required: ['startTime', 'endTime'],
@@ -74,12 +76,12 @@ const tools = [
   },
   {
     name: 'search_opportunities',
-    description: 'Search GHL pipeline opportunities by status or stage',
+    description: 'Search GHL pipeline opportunities',
     inputSchema: {
       type: 'object',
       properties: {
         status: { type: 'string', description: 'open, won, lost, abandoned' },
-        pipelineId: { type: 'string', description: 'Optional pipeline ID' },
+        pipelineId: { type: 'string' },
         limit: { type: 'number' },
       },
     },
@@ -133,7 +135,6 @@ const tools = [
   },
 ];
 
-// ── TOOL HANDLERS ─────────────────────────────────────────────
 async function handleTool(name, args) {
   switch (name) {
     case 'search_contacts': {
@@ -155,11 +156,7 @@ async function handleTool(name, args) {
       return res.data;
     }
     case 'get_appointments': {
-      const params = {
-        locationId: LOCATION_ID,
-        startTime: args.startTime,
-        endTime: args.endTime,
-      };
+      const params = { locationId: LOCATION_ID, startTime: args.startTime, endTime: args.endTime };
       if (args.calendarId) params.calendarId = args.calendarId;
       const res = await GHL.get('/calendars/events', { params });
       return res.data;
@@ -172,9 +169,7 @@ async function handleTool(name, args) {
       return res.data;
     }
     case 'update_opportunity_status': {
-      const res = await GHL.patch(`/opportunities/${args.opportunityId}/status`, {
-        status: args.status,
-      });
+      const res = await GHL.patch(`/opportunities/${args.opportunityId}/status`, { status: args.status });
       return res.data;
     }
     case 'list_workflows': {
@@ -182,16 +177,13 @@ async function handleTool(name, args) {
       return res.data;
     }
     case 'add_contact_to_workflow': {
-      const res = await GHL.post(
-        `/contacts/${args.contactId}/workflow/${args.workflowId}`,
-        { eventStartTime: new Date().toISOString() }
-      );
+      const res = await GHL.post(`/contacts/${args.contactId}/workflow/${args.workflowId}`, {
+        eventStartTime: new Date().toISOString(),
+      });
       return res.data;
     }
     case 'list_pipelines': {
-      const res = await GHL.get('/opportunities/pipelines', {
-        params: { locationId: LOCATION_ID },
-      });
+      const res = await GHL.get('/opportunities/pipelines', { params: { locationId: LOCATION_ID } });
       return res.data;
     }
     case 'send_message': {
@@ -207,61 +199,40 @@ async function handleTool(name, args) {
   }
 }
 
-// ── MCP ENDPOINTS ─────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+const server = new Server(
+  { name: 'ghl-mcp-server', version: '1.0.0' },
+  { capabilities: { tools: {} } }
+);
 
-app.get('/sse', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
-  const init = {
-    jsonrpc: '2.0',
-    method: 'notifications/initialized',
-    params: {
-      protocolVersion: '2024-11-05',
-      serverInfo: { name: 'ghl-mcp-server', version: '1.0.0' },
-      capabilities: { tools: {} },
-    },
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const result = await handleTool(request.params.name, request.params.arguments || {});
+  return {
+    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
   };
-  res.write(`data: ${JSON.stringify(init)}\n\n`);
+});
+
+const transports = {};
+
+app.get('/sse', async (req, res) => {
+  const transport = new SSEServerTransport('/messages', res);
+  transports[transport.sessionId] = transport;
+  res.on('close', () => delete transports[transport.sessionId]);
+  await server.connect(transport);
 });
 
 app.post('/messages', async (req, res) => {
-  const { id, method, params } = req.body;
-
-  try {
-    if (method === 'initialize') {
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: {
-          protocolVersion: '2024-11-05',
-          serverInfo: { name: 'ghl-mcp-server', version: '1.0.0' },
-          capabilities: { tools: {} },
-        },
-      });
-    }
-
-    if (method === 'tools/list') {
-      return res.json({ jsonrpc: '2.0', id, result: { tools } });
-    }
-
-    if (method === 'tools/call') {
-      const result = await handleTool(params.name, params.arguments || {});
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
-      });
-    }
-
-    res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
-  } catch (err) {
-    res.json({
-      jsonrpc: '2.0', id,
-      error: { code: -32000, message: err.message },
-    });
+  const sessionId = req.query.sessionId;
+  const transport = transports[sessionId];
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(400).json({ error: 'No transport found for session' });
   }
 });
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`GHL MCP Server running on port ${PORT}`));
