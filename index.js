@@ -213,9 +213,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   };
 });
 
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+if (!MCP_AUTH_TOKEN) {
+  console.error('MCP_AUTH_TOKEN is not set. Refusing to start without a token.');
+  process.exit(1);
+}
+
+function requireToken(req, res, next) {
+  const header = req.headers.authorization || '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const supplied = bearer || req.query.token;
+  if (supplied && supplied === MCP_AUTH_TOKEN) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
 const transports = {};
 
-app.get('/sse', async (req, res) => {
+app.get('/sse', requireToken, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   const sessionServer = new Server(
     { name: 'ghl-mcp-server', version: '1.0.0' },
@@ -231,7 +245,7 @@ app.get('/sse', async (req, res) => {
   await sessionServer.connect(transport);
 });
 
-app.post('/messages', async (req, res) => {
+app.post('/messages', requireToken, async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
   if (transport) {
