@@ -3,6 +3,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 dotenv.config();
@@ -199,57 +200,64 @@ async function handleTool(name, args) {
   }
 }
 
-const server = new Server(
-  { name: 'ghl-mcp-server', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const result = await handleTool(request.params.name, request.params.arguments || {});
-  return {
-    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-  };
-});
-
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 if (!MCP_AUTH_TOKEN) {
   console.error('MCP_AUTH_TOKEN is not set. Refusing to start without a token.');
   process.exit(1);
 }
 
-function requireToken(req, res, next) {
+function tokenOk(req) {
   const header = req.headers.authorization || '';
   const bearer = header.startsWith('Bearer ') ? header.slice(7) : null;
-  const supplied = bearer || req.query.token;
-  if (supplied && supplied === MCP_AUTH_TOKEN) return next();
+  const supplied = req.params.token || bearer || req.query.token;
+  return supplied && supplied === MCP_AUTH_TOKEN;
+}
+
+function requireToken(req, res, next) {
+  if (tokenOk(req)) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
+function makeServer() {
+  const s = new Server(
+    { name: 'ghl-mcp-server', version: '1.1.0' },
+    { capabilities: { tools: {} } }
+  );
+  s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const result = await handleTool(request.params.name, request.params.arguments || {});
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  });
+  return s;
+}
+
+// Streamable HTTP (what Claude.ai custom connectors use). Token lives in the path.
+// URL to use: https://<host>/mcp/<MCP_AUTH_TOKEN>
+async function handleStreamable(req, res) {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const s = makeServer();
+  res.on('close', () => { transport.close(); s.close(); });
+  await s.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+}
+app.post('/mcp/:token', requireToken, handleStreamable);
+app.get('/mcp/:token', requireToken, handleStreamable);
+app.delete('/mcp/:token', requireToken, handleStreamable);
+
+// Legacy SSE transport, kept for older clients.
 const transports = {};
 
 app.get('/sse', requireToken, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const sessionServer = new Server(
-    { name: 'ghl-mcp-server', version: '1.0.0' },
-    { capabilities: { tools: {} } }
-  );
-  sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-  sessionServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const result = await handleTool(request.params.name, request.params.arguments || {});
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-  });
   transports[transport.sessionId] = transport;
   res.on('close', () => delete transports[transport.sessionId]);
-  await sessionServer.connect(transport);
+  await makeServer().connect(transport);
 });
 
 app.post('/messages', requireToken, async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
+  const transport = transports[req.query.sessionId];
   if (transport) {
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   } else {
     res.status(400).json({ error: 'No transport found for session' });
   }
